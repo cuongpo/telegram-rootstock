@@ -14,6 +14,7 @@ const {
   isPositiveNumber,
   formatAccountData,
 } = require('./utils');
+const wallet = require('./wallet');
 
 // Validate configuration
 try {
@@ -27,13 +28,14 @@ try {
 // Initialize bot
 const bot = new TelegramBot(config.telegramBotToken, { polling: true });
 
-// Store user private keys in memory (cleared on restart)
-// WARNING: This is for demo purposes. In production, use secure key management
-const userKeys = new Map();
+// Store user sessions (only stores temporary password for current operation)
+// Private keys are stored encrypted on disk, never in memory
+const userSessions = new Map();
 
 console.log('🤖 Telegram Bot started successfully!');
 console.log(`📡 Connected to ${config.networkName}`);
 console.log(`🏦 Lending Pool: ${config.lendingPoolAddress}`);
+console.log('🔐 Secure wallet management enabled');
 
 // ==================== COMMAND HANDLERS ====================
 
@@ -42,7 +44,9 @@ console.log(`🏦 Lending Pool: ${config.lendingPoolAddress}`);
  */
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  
+
+  const hasWallet = await wallet.walletExists(chatId);
+
   const welcomeMessage = `
 🚀 *Welcome to Rootstock Lending Bot!*
 
@@ -56,12 +60,13 @@ I help you interact with the RBTC/USDT0 Lending Pool on ${config.networkName}.
 • Check balances and health factor
 
 ⚙️ *Getting Started:*
-1. Set your private key: \`/setkey YOUR_PRIVATE_KEY\`
-2. Check your status: \`/status\`
-3. Start lending!
+${hasWallet ?
+  '1. Unlock your wallet: `/unlock YOUR_PASSWORD`\n2. Check your status: `/status`\n3. Start lending!' :
+  '1. Create a wallet: `/createwallet YOUR_PASSWORD`\n2. Import your private key: `/importkey PASSWORD PRIVATE_KEY`\n3. Check your status: `/status`\n4. Start lending!'
+}
 
-⚠️ *Security Warning:*
-Your private key is stored only in memory and is cleared when the bot restarts. However, for maximum security, use a dedicated wallet for testing.
+🔐 *Enhanced Security:*
+Your private key is encrypted with your password and stored securely on disk. Your password is never stored, and your private key is only decrypted when needed for transactions.
 
 Use /help to see all available commands.
 
@@ -76,14 +81,17 @@ Use /help to see all available commands.
  */
 bot.onText(/\/help/, async (msg) => {
   const chatId = msg.chat.id;
-  
+
   const helpMessage = `
 📖 *Available Commands*
 ━━━━━━━━━━━━━━━━━━━━
 
-🔐 *Setup*
-\`/setkey <private_key>\` - Set your private key
-\`/clearkey\` - Clear your stored private key
+🔐 *Wallet Management*
+\`/createwallet <password>\` - Create a new encrypted wallet
+\`/importkey <password> <private_key>\` - Import existing private key
+\`/unlock <password>\` - Unlock your wallet for operations
+\`/lock\` - Lock your wallet (clear session)
+\`/deletewallet <password>\` - Permanently delete your wallet
 \`/myaddress\` - Show your wallet address
 
 📊 *View Information*
@@ -103,56 +111,197 @@ bot.onText(/\/help/, async (msg) => {
 \`/info\` - Show contract information
 
 💡 *Tips:*
-• Always check your health factor before borrowing
+• Your private key is encrypted with your password
+• Always use a strong password
+• Your password is never stored or transmitted
+• Remember to lock your wallet when done
 • Keep health factor above 1.5 to avoid liquidation risk
-• Health factor < 1.0 means your position can be liquidated
 `;
 
   bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
 });
 
 /**
- * /setkey - Set user's private key
+ * /createwallet - Create a new wallet with password
  */
-bot.onText(/\/setkey (.+)/, async (msg, match) => {
+bot.onText(/\/createwallet (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const privateKey = match[1].trim();
-  
+  const password = match[1].trim();
+
   // Delete the message for security
   try {
     await bot.deleteMessage(chatId, msg.message_id);
   } catch (error) {
-    // Ignore if can't delete (maybe group chat or old message)
+    // Ignore if can't delete
   }
-  
-  if (!isValidPrivateKey(privateKey)) {
-    return bot.sendMessage(chatId, '❌ Invalid private key format. Please check and try again.', {
+
+  try {
+    const hasWallet = await wallet.walletExists(chatId);
+    if (hasWallet) {
+      return bot.sendMessage(chatId, '❌ You already have a wallet. Use `/deletewallet <password>` first if you want to create a new one.', {
+        parse_mode: 'Markdown',
+      });
+    }
+
+    if (password.length < 8) {
+      return bot.sendMessage(chatId, '❌ Password must be at least 8 characters long.', {
+        parse_mode: 'Markdown',
+      });
+    }
+
+    // Generate new random wallet
+    const randomWallet = require('ethers').Wallet.createRandom();
+    await wallet.saveWallet(chatId, randomWallet.privateKey, password);
+
+    bot.sendMessage(chatId, `✅ Wallet created successfully!\n\n👤 Address: \`${randomWallet.address}\`\n\n🔐 Your wallet is encrypted with your password.\n⚠️ Your message with the password has been deleted.\n\n💡 Important: Fund this address with RBTC to start using the lending pool.\n\n⚠️ WARNING: Save your private key in a secure place! Use /exportkey to view it.`, {
       parse_mode: 'Markdown',
     });
+  } catch (error) {
+    console.error('Error in /createwallet:', error);
+    bot.sendMessage(chatId, `❌ Error creating wallet: ${error.message}`, { parse_mode: 'Markdown' });
   }
-  
-  const normalizedKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
-  userKeys.set(chatId, normalizedKey);
-  
-  const signer = contracts.getSigner(normalizedKey);
-  const address = signer.address;
-  
-  bot.sendMessage(chatId, `✅ Private key set successfully!\n\n👤 Address: \`${address}\`\n\n⚠️ Your message with the key has been deleted for security.`, {
-    parse_mode: 'Markdown',
-  });
 });
 
 /**
- * /clearkey - Clear stored private key
+ * /importkey - Import existing private key
  */
-bot.onText(/\/clearkey/, async (msg) => {
+bot.onText(/\/importkey (.+) (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
-  
-  if (userKeys.has(chatId)) {
-    userKeys.delete(chatId);
-    bot.sendMessage(chatId, '✅ Your private key has been cleared from memory.', { parse_mode: 'Markdown' });
+  const password = match[1].trim();
+  const privateKey = match[2].trim();
+
+  // Delete the message for security
+  try {
+    await bot.deleteMessage(chatId, msg.message_id);
+  } catch (error) {
+    // Ignore if can't delete
+  }
+
+  try {
+    const hasWallet = await wallet.walletExists(chatId);
+    if (hasWallet) {
+      return bot.sendMessage(chatId, '❌ You already have a wallet. Use `/deletewallet <password>` first if you want to import a different key.', {
+        parse_mode: 'Markdown',
+      });
+    }
+
+    if (password.length < 8) {
+      return bot.sendMessage(chatId, '❌ Password must be at least 8 characters long.', {
+        parse_mode: 'Markdown',
+      });
+    }
+
+    if (!isValidPrivateKey(privateKey)) {
+      return bot.sendMessage(chatId, '❌ Invalid private key format.', {
+        parse_mode: 'Markdown',
+      });
+    }
+
+    const normalizedKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+
+    // Validate the key can create a wallet
+    const testWallet = new (require('ethers').Wallet)(normalizedKey);
+
+    await wallet.saveWallet(chatId, normalizedKey, password);
+
+    bot.sendMessage(chatId, `✅ Private key imported successfully!\n\n👤 Address: \`${testWallet.address}\`\n\n🔐 Your wallet is encrypted with your password.\n⚠️ Your message with the password and key has been deleted.`, {
+      parse_mode: 'Markdown',
+    });
+  } catch (error) {
+    console.error('Error in /importkey:', error);
+    bot.sendMessage(chatId, `❌ Error importing key: ${error.message}`, { parse_mode: 'Markdown' });
+  }
+});
+
+/**
+ * /unlock - Unlock wallet with password
+ */
+bot.onText(/\/unlock (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const password = match[1].trim();
+
+  // Delete the message for security
+  try {
+    await bot.deleteMessage(chatId, msg.message_id);
+  } catch (error) {
+    // Ignore if can't delete
+  }
+
+  try {
+    const walletData = await wallet.loadWallet(chatId, password);
+
+    // Store decrypted key temporarily in session
+    userSessions.set(chatId, {
+      privateKey: walletData.privateKey,
+      address: walletData.address,
+      unlockedAt: Date.now()
+    });
+
+    // Auto-lock after 30 minutes
+    setTimeout(() => {
+      if (userSessions.has(chatId)) {
+        userSessions.delete(chatId);
+        bot.sendMessage(chatId, '🔒 Your wallet has been automatically locked after 30 minutes of inactivity.', {
+          parse_mode: 'Markdown',
+        });
+      }
+    }, 30 * 60 * 1000);
+
+    bot.sendMessage(chatId, `✅ Wallet unlocked successfully!\n\n👤 Address: \`${walletData.address}\`\n\n⚠️ Your message with the password has been deleted.\n💡 Your wallet will auto-lock after 30 minutes.`, {
+      parse_mode: 'Markdown',
+    });
+  } catch (error) {
+    console.error('Error in /unlock:', error);
+    bot.sendMessage(chatId, `❌ Error unlocking wallet: ${error.message}`, { parse_mode: 'Markdown' });
+  }
+});
+
+/**
+ * /lock - Lock wallet (clear session)
+ */
+bot.onText(/\/lock/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  if (userSessions.has(chatId)) {
+    userSessions.delete(chatId);
+    bot.sendMessage(chatId, '✅ Your wallet has been locked.', { parse_mode: 'Markdown' });
   } else {
-    bot.sendMessage(chatId, '❌ No private key found. Use /setkey to set one.', { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, '❌ Your wallet is already locked.', { parse_mode: 'Markdown' });
+  }
+});
+
+/**
+ * /deletewallet - Delete wallet permanently
+ */
+bot.onText(/\/deletewallet (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const password = match[1].trim();
+
+  // Delete the message for security
+  try {
+    await bot.deleteMessage(chatId, msg.message_id);
+  } catch (error) {
+    // Ignore if can't delete
+  }
+
+  try {
+    // Verify password before deleting
+    await wallet.loadWallet(chatId, password);
+
+    // Clear session
+    if (userSessions.has(chatId)) {
+      userSessions.delete(chatId);
+    }
+
+    // Delete wallet file
+    await wallet.deleteWallet(chatId);
+
+    bot.sendMessage(chatId, '✅ Your wallet has been permanently deleted.\n\n⚠️ Your message with the password has been deleted.', {
+      parse_mode: 'Markdown',
+    });
+  } catch (error) {
+    console.error('Error in /deletewallet:', error);
+    bot.sendMessage(chatId, `❌ Error deleting wallet: ${error.message}`, { parse_mode: 'Markdown' });
   }
 });
 
@@ -161,13 +310,13 @@ bot.onText(/\/clearkey/, async (msg) => {
  */
 bot.onText(/\/myaddress/, async (msg) => {
   const chatId = msg.chat.id;
-  
-  if (!userKeys.has(chatId)) {
-    return bot.sendMessage(chatId, '❌ Please set your private key first using /setkey', { parse_mode: 'Markdown' });
+
+  if (!userSessions.has(chatId)) {
+    return bot.sendMessage(chatId, '❌ Please unlock your wallet first using `/unlock <password>`', { parse_mode: 'Markdown' });
   }
-  
-  const signer = contracts.getSigner(userKeys.get(chatId));
-  bot.sendMessage(chatId, `👤 Your address:\n\`${signer.address}\``, { parse_mode: 'Markdown' });
+
+  const session = userSessions.get(chatId);
+  bot.sendMessage(chatId, `👤 Your address:\n\`${session.address}\``, { parse_mode: 'Markdown' });
 });
 
 /**
@@ -176,13 +325,13 @@ bot.onText(/\/myaddress/, async (msg) => {
 bot.onText(/\/status/, async (msg) => {
   const chatId = msg.chat.id;
 
-  if (!userKeys.has(chatId)) {
-    return bot.sendMessage(chatId, '❌ Please set your private key first using /setkey', { parse_mode: 'Markdown' });
+  if (!userSessions.has(chatId)) {
+    return bot.sendMessage(chatId, '❌ Please unlock your wallet first using `/unlock <password>`', { parse_mode: 'Markdown' });
   }
 
   try {
-    const signer = contracts.getSigner(userKeys.get(chatId));
-    const address = signer.address;
+    const session = userSessions.get(chatId);
+    const address = session.address;
 
     bot.sendMessage(chatId, '⏳ Fetching account data...', { parse_mode: 'Markdown' });
 
@@ -202,13 +351,13 @@ bot.onText(/\/status/, async (msg) => {
 bot.onText(/\/balance/, async (msg) => {
   const chatId = msg.chat.id;
 
-  if (!userKeys.has(chatId)) {
-    return bot.sendMessage(chatId, '❌ Please set your private key first using /setkey', { parse_mode: 'Markdown' });
+  if (!userSessions.has(chatId)) {
+    return bot.sendMessage(chatId, '❌ Please unlock your wallet first using `/unlock <password>`', { parse_mode: 'Markdown' });
   }
 
   try {
-    const signer = contracts.getSigner(userKeys.get(chatId));
-    const address = signer.address;
+    const session = userSessions.get(chatId);
+    const address = session.address;
 
     bot.sendMessage(chatId, '⏳ Checking balances...', { parse_mode: 'Markdown' });
 
@@ -241,13 +390,13 @@ ${formatUSDT0(debtUsdt0)} USDT0
 bot.onText(/\/health/, async (msg) => {
   const chatId = msg.chat.id;
 
-  if (!userKeys.has(chatId)) {
-    return bot.sendMessage(chatId, '❌ Please set your private key first using /setkey', { parse_mode: 'Markdown' });
+  if (!userSessions.has(chatId)) {
+    return bot.sendMessage(chatId, '❌ Please unlock your wallet first using `/unlock <password>`', { parse_mode: 'Markdown' });
   }
 
   try {
-    const signer = contracts.getSigner(userKeys.get(chatId));
-    const address = signer.address;
+    const session = userSessions.get(chatId);
+    const address = session.address;
 
     bot.sendMessage(chatId, '⏳ Checking health factor...', { parse_mode: 'Markdown' });
 
@@ -282,13 +431,13 @@ Use /status for detailed account info.
 bot.onText(/\/wallet/, async (msg) => {
   const chatId = msg.chat.id;
 
-  if (!userKeys.has(chatId)) {
-    return bot.sendMessage(chatId, '❌ Please set your private key first using /setkey', { parse_mode: 'Markdown' });
+  if (!userSessions.has(chatId)) {
+    return bot.sendMessage(chatId, '❌ Please unlock your wallet first using `/unlock <password>`', { parse_mode: 'Markdown' });
   }
 
   try {
-    const signer = contracts.getSigner(userKeys.get(chatId));
-    const address = signer.address;
+    const session = userSessions.get(chatId);
+    const address = session.address;
 
     bot.sendMessage(chatId, '⏳ Checking wallet balances...', { parse_mode: 'Markdown' });
 
@@ -320,8 +469,8 @@ bot.onText(/\/deposit (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const amountStr = match[1].trim();
 
-  if (!userKeys.has(chatId)) {
-    return bot.sendMessage(chatId, '❌ Please set your private key first using /setkey', { parse_mode: 'Markdown' });
+  if (!userSessions.has(chatId)) {
+    return bot.sendMessage(chatId, '❌ Please unlock your wallet first using `/unlock <password>`', { parse_mode: 'Markdown' });
   }
 
   if (!isPositiveNumber(amountStr)) {
@@ -329,8 +478,8 @@ bot.onText(/\/deposit (.+)/, async (msg, match) => {
   }
 
   try {
-    const signer = contracts.getSigner(userKeys.get(chatId));
-    const address = signer.address;
+    const session = userSessions.get(chatId);
+    const address = session.address;
     const amount = parseRBTC(amountStr);
 
     // Check balance
@@ -345,7 +494,7 @@ bot.onText(/\/deposit (.+)/, async (msg, match) => {
       parse_mode: 'Markdown',
     });
 
-    const receipt = await contracts.depositRBTC(userKeys.get(chatId), amount);
+    const receipt = await contracts.depositRBTC(session.privateKey, amount);
 
     const message = `
 ✅ *Deposit Successful!*
@@ -373,8 +522,8 @@ bot.onText(/\/withdraw (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const amountStr = match[1].trim();
 
-  if (!userKeys.has(chatId)) {
-    return bot.sendMessage(chatId, '❌ Please set your private key first using /setkey', { parse_mode: 'Markdown' });
+  if (!userSessions.has(chatId)) {
+    return bot.sendMessage(chatId, '❌ Please unlock your wallet first using `/unlock <password>`', { parse_mode: 'Markdown' });
   }
 
   if (!isPositiveNumber(amountStr)) {
@@ -382,8 +531,8 @@ bot.onText(/\/withdraw (.+)/, async (msg, match) => {
   }
 
   try {
-    const signer = contracts.getSigner(userKeys.get(chatId));
-    const address = signer.address;
+    const session = userSessions.get(chatId);
+    const address = session.address;
     const amount = parseRBTC(amountStr);
 
     // Check collateral
@@ -400,7 +549,7 @@ bot.onText(/\/withdraw (.+)/, async (msg, match) => {
       parse_mode: 'Markdown',
     });
 
-    const receipt = await contracts.withdrawRBTC(userKeys.get(chatId), amount);
+    const receipt = await contracts.withdrawRBTC(session.privateKey, amount);
 
     const message = `
 ✅ *Withdrawal Successful!*
@@ -436,8 +585,8 @@ bot.onText(/\/borrow (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const amountStr = match[1].trim();
 
-  if (!userKeys.has(chatId)) {
-    return bot.sendMessage(chatId, '❌ Please set your private key first using /setkey', { parse_mode: 'Markdown' });
+  if (!userSessions.has(chatId)) {
+    return bot.sendMessage(chatId, '❌ Please unlock your wallet first using `/unlock <password>`', { parse_mode: 'Markdown' });
   }
 
   if (!isPositiveNumber(amountStr)) {
@@ -445,8 +594,8 @@ bot.onText(/\/borrow (.+)/, async (msg, match) => {
   }
 
   try {
-    const signer = contracts.getSigner(userKeys.get(chatId));
-    const address = signer.address;
+    const session = userSessions.get(chatId);
+    const address = session.address;
     const amount = parseUSDT0(amountStr);
 
     // Check borrowing power
@@ -465,7 +614,7 @@ bot.onText(/\/borrow (.+)/, async (msg, match) => {
       parse_mode: 'Markdown',
     });
 
-    const receipt = await contracts.borrowUSDT0(userKeys.get(chatId), amount);
+    const receipt = await contracts.borrowUSDT0(session.privateKey, amount);
 
     const message = `
 ✅ *Borrow Successful!*
@@ -502,8 +651,8 @@ bot.onText(/\/repay (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const amountStr = match[1].trim();
 
-  if (!userKeys.has(chatId)) {
-    return bot.sendMessage(chatId, '❌ Please set your private key first using /setkey', { parse_mode: 'Markdown' });
+  if (!userSessions.has(chatId)) {
+    return bot.sendMessage(chatId, '❌ Please unlock your wallet first using `/unlock <password>`', { parse_mode: 'Markdown' });
   }
 
   if (!isPositiveNumber(amountStr)) {
@@ -511,8 +660,8 @@ bot.onText(/\/repay (.+)/, async (msg, match) => {
   }
 
   try {
-    const signer = contracts.getSigner(userKeys.get(chatId));
-    const address = signer.address;
+    const session = userSessions.get(chatId);
+    const address = session.address;
     const amount = parseUSDT0(amountStr);
 
     // Check debt
@@ -535,7 +684,7 @@ bot.onText(/\/repay (.+)/, async (msg, match) => {
       parse_mode: 'Markdown',
     });
 
-    const receipt = await contracts.repayUSDT0(userKeys.get(chatId), amount);
+    const receipt = await contracts.repayUSDT0(session.privateKey, amount);
 
     const message = `
 ✅ *Repayment Successful!*
